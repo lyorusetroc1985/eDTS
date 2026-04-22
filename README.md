@@ -20,6 +20,7 @@
 7. Audit + notification events are persisted asynchronously.
 
 **Tech decisions**
+- Minimum supported database: MySQL **8.0+** (for `utf8mb4_0900_ai_ci`, JSON, and modern indexing).
 - MySQL InnoDB + FK constraints for integrity.
 - UTC timestamps (`TIMESTAMP`) everywhere.
 - Immutable audit table + append-only history.
@@ -61,7 +62,7 @@ CREATE TABLE users (
   password_hash VARCHAR(255) NOT NULL,
   full_name VARCHAR(150) NOT NULL,
   department_id BIGINT UNSIGNED NULL,
-  is_active TINYINT(1) NOT NULL DEFAULT 1,
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
   failed_logins INT UNSIGNED NOT NULL DEFAULT 0,
   locked_until TIMESTAMP NULL,
   last_login_at TIMESTAMP NULL,
@@ -84,7 +85,7 @@ CREATE TABLE workflows (
   id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
   name VARCHAR(120) NOT NULL,
   description VARCHAR(255) NULL,
-  is_active TINYINT(1) NOT NULL DEFAULT 1,
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
   created_by BIGINT UNSIGNED NOT NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -99,7 +100,7 @@ CREATE TABLE workflow_steps (
   step_name VARCHAR(120) NOT NULL,
   assigned_role_id BIGINT UNSIGNED NULL,
   assigned_department_id BIGINT UNSIGNED NULL,
-  is_final TINYINT(1) NOT NULL DEFAULT 0,
+  is_final BOOLEAN NOT NULL DEFAULT FALSE,
   condition_expression JSON NULL,
   sla_hours INT UNSIGNED NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -178,7 +179,7 @@ CREATE TABLE document_history (
   from_status VARCHAR(30) NULL,
   to_status VARCHAR(30) NULL,
   remarks TEXT NULL,
-  ip_address VARBINARY(16) NULL,
+  ip_address VARBINARY(16) NULL COMMENT 'Store INET6_ATON(ip) to support both IPv4 and IPv6',
   user_agent VARCHAR(255) NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   CONSTRAINT fk_history_document FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE,
@@ -194,7 +195,7 @@ CREATE TABLE audit_logs (
   action VARCHAR(60) NOT NULL,
   before_state JSON NULL,
   after_state JSON NULL,
-  ip_address VARBINARY(16) NULL,
+  ip_address VARBINARY(16) NULL COMMENT 'Store INET6_ATON(ip) to support both IPv4 and IPv6',
   request_id CHAR(36) NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   CONSTRAINT fk_audit_actor FOREIGN KEY (actor_user_id) REFERENCES users(id),
@@ -209,7 +210,7 @@ CREATE TABLE notifications (
   channel ENUM('in_app','email') NOT NULL DEFAULT 'in_app',
   subject VARCHAR(180) NOT NULL,
   body TEXT NOT NULL,
-  is_read TINYINT(1) NOT NULL DEFAULT 0,
+  is_read BOOLEAN NOT NULL DEFAULT FALSE,
   sent_at TIMESTAMP NULL,
   read_at TIMESTAMP NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -315,6 +316,7 @@ declare(strict_types=1);
 
 namespace App\Services;
 
+use DateTimeImmutable;
 use PDO;
 
 final class AuthService
@@ -333,13 +335,26 @@ final class AuthService
             return false;
         }
 
-        if ($user['locked_until'] !== null && strtotime((string)$user['locked_until']) > time()) {
-            return false;
+        if ($user['locked_until'] !== null) {
+            $lockedUntil = new DateTimeImmutable((string)$user['locked_until']);
+            if ($lockedUntil > new DateTimeImmutable('now')) {
+                return false;
+            }
         }
 
         if (!password_verify($password, (string)$user['password_hash'])) {
+            $this->db->prepare('UPDATE users SET failed_logins = failed_logins + 1 WHERE id = :id')
+                ->execute([':id' => (int)$user['id']]);
+
+            $this->db->prepare(
+                'UPDATE users SET locked_until = DATE_ADD(UTC_TIMESTAMP(), INTERVAL 15 MINUTE)
+                 WHERE id = :id AND failed_logins >= 5'
+            )->execute([':id' => (int)$user['id']]);
             return false;
         }
+
+        $this->db->prepare('UPDATE users SET failed_logins = 0, locked_until = NULL WHERE id = :id')
+            ->execute([':id' => (int)$user['id']]);
 
         session_regenerate_id(true);
         $_SESSION['uid'] = (int)$user['id'];
@@ -347,6 +362,12 @@ final class AuthService
         return true;
     }
 }
+```
+
+```php
+<?php
+// During user registration / password reset
+$passwordHash = password_hash($plainPassword, PASSWORD_ARGON2ID);
 ```
 
 ```php
@@ -516,7 +537,8 @@ server {
     fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;
     fastcgi_pass unix:/run/php/php8.2-fpm.sock;
   }
-  location ~* /(?:storage|app|config|database)/ { deny all; }
+  location ~* /(?:storage|app|config|database|vendor|tests)/ { deny all; }
+  location ~ /\.env { deny all; }
 }
 ```
 
@@ -544,4 +566,3 @@ server {
 6. **Notifications**: in-app bell feed, email SMTP adapter, overdue cron.
 7. **Admin & Reports**: settings, user/role CRUD, dashboard widgets, CSV/PDF exports.
 8. **Quality & Release**: PHPUnit tests, security tests, load test, backups, monitoring, go-live checklist.
-
