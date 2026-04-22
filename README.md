@@ -21,6 +21,7 @@
 
 **Tech decisions**
 - Minimum supported database: MySQL **8.0+** (for `utf8mb4_0900_ai_ci`, JSON, and modern indexing).
+- If legacy compatibility is required (MySQL 5.7), use `utf8mb4_unicode_ci` instead of `utf8mb4_0900_ai_ci`.
 - MySQL InnoDB + FK constraints for integrity.
 - UTC timestamps (`TIMESTAMP`) everywhere.
 - Immutable audit table + append-only history.
@@ -41,6 +42,7 @@ CREATE DATABASE IF NOT EXISTS edts
   COLLATE utf8mb4_0900_ai_ci;
 USE edts;
 
+-- MySQL BOOLEAN is an alias of TINYINT(1): 0=false, 1=true.
 CREATE TABLE roles (
   id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
   name VARCHAR(50) NOT NULL UNIQUE,
@@ -350,6 +352,7 @@ final class AuthService
                 'UPDATE users SET locked_until = DATE_ADD(UTC_TIMESTAMP(), INTERVAL 15 MINUTE)
                  WHERE id = :id AND failed_logins >= 5'
             )->execute([':id' => (int)$user['id']]);
+            // Locks account on the 5th failed attempt.
             return false;
         }
 
@@ -367,7 +370,20 @@ final class AuthService
 ```php
 <?php
 // During user registration / password reset
-$passwordHash = password_hash($plainPassword, PASSWORD_ARGON2ID);
+$algo = defined('PASSWORD_ARGON2ID') ? PASSWORD_ARGON2ID : PASSWORD_BCRYPT;
+$options = $algo === PASSWORD_ARGON2ID
+    ? ['memory_cost' => 1 << 17, 'time_cost' => 4, 'threads' => 2]
+    : ['cost' => 12];
+$passwordHash = password_hash($plainPassword, $algo, $options);
+```
+
+```php
+<?php
+// IP storage/retrieval with INET6_ATON / INET6_NTOA
+$insert = $pdo->prepare('INSERT INTO audit_logs (actor_user_id, entity_type, action, ip_address) VALUES (:uid,:type,:action,INET6_ATON(:ip))');
+$insert->execute([':uid' => 1, ':type' => 'document', ':action' => 'viewed', ':ip' => $_SERVER['REMOTE_ADDR'] ?? '127.0.0.1']);
+
+$row = $pdo->query('SELECT INET6_NTOA(ip_address) AS ip_text FROM audit_logs ORDER BY id DESC LIMIT 1')->fetch();
 ```
 
 ```php
@@ -537,14 +553,14 @@ server {
     fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;
     fastcgi_pass unix:/run/php/php8.2-fpm.sock;
   }
-  location ~* /(?:storage|app|config|database|vendor|tests)/ { deny all; }
+  location ~* ^/(?:storage|app|config|database|vendor|tests)/ { deny all; }
   location ~ /\.env { deny all; }
 }
 ```
 
 **Cron jobs**
 - `*/5 * * * * php /var/www/edts/bin/notify-overdue.php`
-- `0 2 * * * mysqldump --single-transaction edts > /backups/edts_$(date +\%F).sql`
+- `0 2 * * * mysqldump --defaults-extra-file=/etc/edts/.my.cnf --single-transaction edts | gzip > /backups/edts_$(date +\%F).sql.gz`
 
 **Deployment**
 1. Provision Linux + PHP 8.2 + MySQL 8 + Nginx.
