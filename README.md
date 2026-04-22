@@ -22,6 +22,7 @@
 **Tech decisions**
 - Minimum supported database: MySQL **8.0+** (for `utf8mb4_0900_ai_ci`, JSON, and modern indexing).
 - If legacy compatibility is required (MySQL 5.7), use `utf8mb4_unicode_ci` instead of `utf8mb4_0900_ai_ci`.
+- Target platform is Oracle MySQL 8.0+ (not MariaDB) for full feature parity.
 - MySQL InnoDB + FK constraints for integrity.
 - UTC timestamps (`TIMESTAMP`) everywhere.
 - Immutable audit table + append-only history.
@@ -181,7 +182,7 @@ CREATE TABLE document_history (
   from_status VARCHAR(30) NULL,
   to_status VARCHAR(30) NULL,
   remarks TEXT NULL,
-  ip_address VARBINARY(16) NULL COMMENT 'Store INET6_ATON(ip): IPv4 uses 4 bytes, IPv6 up to 16 bytes',
+  ip_address VARBINARY(16) NULL COMMENT 'Store packed IP bytes (INET6_ATON/inet_pton): IPv4=4 bytes, IPv6=16 bytes',
   user_agent VARCHAR(255) NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   CONSTRAINT fk_history_document FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE,
@@ -197,7 +198,7 @@ CREATE TABLE audit_logs (
   action VARCHAR(60) NOT NULL,
   before_state JSON NULL,
   after_state JSON NULL,
-  ip_address VARBINARY(16) NULL COMMENT 'Store INET6_ATON(ip): IPv4 uses 4 bytes, IPv6 up to 16 bytes',
+  ip_address VARBINARY(16) NULL COMMENT 'Store packed IP bytes (INET6_ATON/inet_pton): IPv4=4 bytes, IPv6=16 bytes',
   request_id CHAR(36) NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   CONSTRAINT fk_audit_actor FOREIGN KEY (actor_user_id) REFERENCES users(id),
@@ -370,6 +371,7 @@ final class AuthService
 ```php
 <?php
 // During user registration / password reset
+// Requires PHP Argon2 support (common in PHP 8.2 builds).
 $passwordHash = password_hash($plainPassword, PASSWORD_ARGON2ID, [
     'memory_cost' => 1 << 17,
     'time_cost' => 4,
@@ -380,10 +382,17 @@ $passwordHash = password_hash($plainPassword, PASSWORD_ARGON2ID, [
 ```php
 <?php
 // IP storage/retrieval with INET6_ATON / INET6_NTOA
-$insert = $pdo->prepare('INSERT INTO audit_logs (actor_user_id, entity_type, action, ip_address) VALUES (:uid,:type,:action,INET6_ATON(:ip))');
-$insert->execute([':uid' => 1, ':type' => 'document', ':action' => 'viewed', ':ip' => $_SERVER['REMOTE_ADDR'] ?? null]);
+$ipBytes = isset($_SERVER['REMOTE_ADDR']) ? inet_pton($_SERVER['REMOTE_ADDR']) : null;
+$insert = $pdo->prepare('INSERT INTO audit_logs (actor_user_id, entity_type, action, ip_address) VALUES (:uid,:type,:action,:ip)');
+$insert->bindValue(':uid', 1, PDO::PARAM_INT);
+$insert->bindValue(':type', 'document', PDO::PARAM_STR);
+$insert->bindValue(':action', 'viewed', PDO::PARAM_STR);
+$insert->bindValue(':ip', $ipBytes, $ipBytes === null ? PDO::PARAM_NULL : PDO::PARAM_LOB);
+$insert->execute();
 
-$row = $pdo->query('SELECT INET6_NTOA(ip_address) AS ip_text FROM audit_logs ORDER BY id DESC LIMIT 1')->fetch();
+$read = $pdo->prepare('SELECT INET6_NTOA(ip_address) AS ip_text FROM audit_logs ORDER BY id DESC LIMIT 1');
+$read->execute();
+$row = $read->fetch();
 ```
 
 ```php
@@ -554,7 +563,7 @@ server {
     fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;
     fastcgi_pass unix:/run/php/php8.2-fpm.sock;
   }
-  location ~* ^/(?:storage|app|config|database|vendor|tests)/ { deny all; }
+  location ~ ^/(?:storage|app|config|database|vendor|tests)/ { deny all; }
   location ~ /\.env { deny all; }
 }
 ```
