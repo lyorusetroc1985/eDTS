@@ -42,7 +42,7 @@ CREATE DATABASE IF NOT EXISTS edts
   COLLATE utf8mb4_0900_ai_ci;
 USE edts;
 
--- MySQL BOOLEAN is an alias of TINYINT(1): 0=false, 1=true.
+-- MySQL BOOLEAN is an alias of TINYINT(1): 0=false, non-zero=true.
 CREATE TABLE roles (
   id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
   name VARCHAR(50) NOT NULL UNIQUE,
@@ -181,7 +181,7 @@ CREATE TABLE document_history (
   from_status VARCHAR(30) NULL,
   to_status VARCHAR(30) NULL,
   remarks TEXT NULL,
-  ip_address VARBINARY(16) NULL COMMENT 'Store INET6_ATON(ip) to support both IPv4 and IPv6',
+  ip_address VARBINARY(16) NULL COMMENT 'Store INET6_ATON(ip): IPv4 uses 4 bytes, IPv6 up to 16 bytes',
   user_agent VARCHAR(255) NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   CONSTRAINT fk_history_document FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE,
@@ -197,7 +197,7 @@ CREATE TABLE audit_logs (
   action VARCHAR(60) NOT NULL,
   before_state JSON NULL,
   after_state JSON NULL,
-  ip_address VARBINARY(16) NULL COMMENT 'Store INET6_ATON(ip) to support both IPv4 and IPv6',
+  ip_address VARBINARY(16) NULL COMMENT 'Store INET6_ATON(ip): IPv4 uses 4 bytes, IPv6 up to 16 bytes',
   request_id CHAR(36) NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   CONSTRAINT fk_audit_actor FOREIGN KEY (actor_user_id) REFERENCES users(id),
@@ -352,7 +352,7 @@ final class AuthService
                 'UPDATE users SET locked_until = DATE_ADD(UTC_TIMESTAMP(), INTERVAL 15 MINUTE)
                  WHERE id = :id AND failed_logins >= 5'
             )->execute([':id' => (int)$user['id']]);
-            // Locks account on the 5th failed attempt.
+            // Locks account when failed_logins reaches 5.
             return false;
         }
 
@@ -370,18 +370,18 @@ final class AuthService
 ```php
 <?php
 // During user registration / password reset
-$algo = defined('PASSWORD_ARGON2ID') ? PASSWORD_ARGON2ID : PASSWORD_BCRYPT;
-$options = $algo === PASSWORD_ARGON2ID
-    ? ['memory_cost' => 1 << 17, 'time_cost' => 4, 'threads' => 2]
-    : ['cost' => 12];
-$passwordHash = password_hash($plainPassword, $algo, $options);
+$passwordHash = password_hash($plainPassword, PASSWORD_ARGON2ID, [
+    'memory_cost' => 1 << 17,
+    'time_cost' => 4,
+    'threads' => 2,
+]);
 ```
 
 ```php
 <?php
 // IP storage/retrieval with INET6_ATON / INET6_NTOA
 $insert = $pdo->prepare('INSERT INTO audit_logs (actor_user_id, entity_type, action, ip_address) VALUES (:uid,:type,:action,INET6_ATON(:ip))');
-$insert->execute([':uid' => 1, ':type' => 'document', ':action' => 'viewed', ':ip' => $_SERVER['REMOTE_ADDR'] ?? '127.0.0.1']);
+$insert->execute([':uid' => 1, ':type' => 'document', ':action' => 'viewed', ':ip' => $_SERVER['REMOTE_ADDR'] ?? null]);
 
 $row = $pdo->query('SELECT INET6_NTOA(ip_address) AS ip_text FROM audit_logs ORDER BY id DESC LIMIT 1')->fetch();
 ```
@@ -458,7 +458,7 @@ final class CsrfMiddleware
 - Validate by MIME (`finfo`), extension allowlist, max size.
 - Generate `sha256_file()` for path: `storage/uploads/ab/cd/<hash>.bin`.
 - Store original filename + mime + size + hash in metadata.
-- Never execute uploaded files; serve via download controller with auth checks.
+- Never execute uploaded files; serve via download controller with auth checks and disable script execution in upload directories.
 
 ---
 
@@ -543,6 +543,7 @@ ORDER BY dh.created_at ASC;
 - [x] Immutable audit logs + restricted DB permissions
 
 **Nginx**
+(`public/` is the web root in this layout)
 ```nginx
 server {
   root /var/www/edts/public;
